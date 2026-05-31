@@ -463,4 +463,150 @@ mod tests {
         assert_eq!(pos.funding_fee_amount_per_size, global_value,
             "position tracker must be reset to current global after settlement");
     }
+
+    // ── Issue #136: property tests for position_utils ─────────────────────────
+
+    /// get_position_pnl_usd returns 0 when the position has zero size.
+    #[test]
+    fn property_pnl_zero_for_zero_size_position() {
+        let w = setup();
+        let mut pos = make_position(&w, 0, 0, 2_000 * FP);
+        pos.size_in_tokens = 0;
+        let price_props = PriceProps { min: 2_000 * FP, max: 2_000 * FP };
+        let (pnl, _) = get_position_pnl_usd(&w.env, &pos, &price_props, 0);
+        assert_eq!(pnl, 0, "zero-size position must have zero PnL");
+    }
+
+    /// A long position has zero PnL when the current price equals the entry price.
+    #[test]
+    fn property_long_pnl_zero_at_entry_price() {
+        let w           = setup();
+        let entry_price = 2_000 * FP;
+        let size_usd    = 1_000 * FP;
+        let pos         = make_position(&w, size_usd, ONE_TOKEN * 10, entry_price);
+        let price_props = PriceProps { min: entry_price, max: entry_price };
+        let (pnl, _)    = get_position_pnl_usd(&w.env, &pos, &price_props, size_usd);
+        // pnl = tokens * price / TOKEN_PRECISION - size_in_usd
+        //     = (size_usd / entry_price * TOKEN_PRECISION) * entry_price / TOKEN_PRECISION - size_usd
+        //     ≈ 0  (up to rounding)
+        let tol = 1i128;
+        assert!(
+            pnl.abs() <= tol,
+            "long PnL must be ~0 at entry price; got {pnl}"
+        );
+    }
+
+    /// A long position has negative PnL when the price drops below entry.
+    #[test]
+    fn property_long_pnl_negative_when_price_falls() {
+        let w           = setup();
+        let entry_price = 2_000 * FP;
+        let exit_price  = 1_000 * FP; // halved
+        let size_usd    = 1_000 * FP;
+        let pos         = make_position(&w, size_usd, ONE_TOKEN * 10, entry_price);
+        let price_props = PriceProps { min: exit_price, max: exit_price };
+        let (pnl, _)    = get_position_pnl_usd(&w.env, &pos, &price_props, size_usd);
+        assert!(pnl < 0, "long position must have negative PnL when price falls; got {pnl}");
+    }
+
+    /// A long position has positive PnL when the price rises above entry.
+    #[test]
+    fn property_long_pnl_positive_when_price_rises() {
+        let w           = setup();
+        let entry_price = 2_000 * FP;
+        let exit_price  = 4_000 * FP; // doubled
+        let size_usd    = 1_000 * FP;
+        let pos         = make_position(&w, size_usd, ONE_TOKEN * 10, entry_price);
+        let price_props = PriceProps { min: exit_price, max: exit_price };
+        let (pnl, _)    = get_position_pnl_usd(&w.env, &pos, &price_props, size_usd);
+        assert!(pnl > 0, "long position must have positive PnL when price rises; got {pnl}");
+    }
+
+    /// All fee components are non-negative (no underflow into negative fees).
+    #[test]
+    fn property_position_fees_never_negative() {
+        let w    = setup();
+        let ds_c = DsClient::new(&w.env, &w.ds);
+
+        // Seed non-zero fee factors
+        let fee_factor: i128 = FP / 1_000; // 0.1%
+        ds_c.set_u128(&w.admin, &gmx_keys::position_fee_factor_key(&w.env, &w.market_tk, true), &(fee_factor as u128));
+
+        let cum_factor: i128 = FP / 500;
+        ds_c.set_u128(&w.admin, &gmx_keys::cumulative_borrowing_factor_key(&w.env, &w.market_tk, true), &(cum_factor as u128));
+
+        let market   = make_market(&w);
+        let position = make_position(&w, 1_000 * FP, ONE_TOKEN * 5, 2_000 * FP);
+
+        let fees = get_position_fees(&w.env, &w.ds, &market, &position, 2_000 * FP, 1_000 * FP, true);
+
+        assert!(fees.borrowing_fee_amount >= 0, "borrowing fee must not be negative: {}", fees.borrowing_fee_amount);
+        assert!(fees.funding_fee_amount   >= 0, "funding fee must not be negative: {}", fees.funding_fee_amount);
+        assert!(fees.position_fee_amount  >= 0, "position fee must not be negative: {}", fees.position_fee_amount);
+        assert!(fees.total_cost_amount    >= 0, "total cost must not be negative: {}", fees.total_cost_amount);
+    }
+
+    /// total_cost_amount == borrowing + funding + position fees (no hidden component).
+    #[test]
+    fn property_total_cost_is_sum_of_components() {
+        let w    = setup();
+        let ds_c = DsClient::new(&w.env, &w.ds);
+
+        let fee_factor: i128 = FP / 2_000;
+        ds_c.set_u128(&w.admin, &gmx_keys::position_fee_factor_key(&w.env, &w.market_tk, true), &(fee_factor as u128));
+
+        let market   = make_market(&w);
+        let position = make_position(&w, 2_000 * FP, ONE_TOKEN * 8, 2_000 * FP);
+
+        let fees = get_position_fees(&w.env, &w.ds, &market, &position, 2_000 * FP, 1_000 * FP, true);
+
+        assert_eq!(
+            fees.total_cost_amount,
+            fees.borrowing_fee_amount + fees.funding_fee_amount + fees.position_fee_amount,
+            "total_cost must equal sum of components"
+        );
+    }
+
+    /// Partial close PnL scales linearly with size_delta (property: proportionality).
+    /// Closing 50% of a position should yield 50% of the full PnL (within rounding).
+    #[test]
+    fn property_partial_close_pnl_proportional_to_size() {
+        let w           = setup();
+        let entry_price = 2_000 * FP;
+        let exit_price  = 3_000 * FP;
+        let size_usd    = 1_000 * FP;
+        let pos         = make_position(&w, size_usd, ONE_TOKEN * 10, entry_price);
+        let price_props = PriceProps { min: exit_price, max: exit_price };
+
+        let (full_pnl,    _) = get_position_pnl_usd(&w.env, &pos, &price_props, size_usd);
+        let (half_pnl,    _) = get_position_pnl_usd(&w.env, &pos, &price_props, size_usd / 2);
+
+        // half_pnl should be ~50% of full_pnl (within 1 unit rounding)
+        let expected_half = full_pnl / 2;
+        assert!(
+            (half_pnl - expected_half).abs() <= 1,
+            "partial close PnL must be proportional: full={full_pnl}, half={half_pnl}, expected_half={expected_half}"
+        );
+    }
+
+    /// is_liquidatable returns false for a well-collateralised position at entry price.
+    #[test]
+    fn property_healthy_position_is_not_liquidatable() {
+        let w       = setup();
+        let ds_c    = DsClient::new(&w.env, &w.ds);
+        let entry_p = 2_000 * FP;
+        let market  = make_market(&w);
+
+        // Set min collateral factor (1%)
+        ds_c.set_u128(&w.admin, &gmx_keys::min_collateral_factor_key(&w.env, &w.market_tk), &((FP / 100) as u128));
+
+        // Large collateral relative to size → very healthy
+        let position = make_position(&w, 1_000 * FP, ONE_TOKEN * 100, entry_p);
+        let price_props = PriceProps { min: entry_p, max: entry_p };
+
+        assert!(
+            !is_liquidatable(&w.env, &w.ds, &position, &market, entry_p, &price_props),
+            "well-collateralised position at entry price must not be liquidatable"
+        );
+    }
 }

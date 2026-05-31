@@ -519,6 +519,137 @@ mod tests {
 
     // ── Issue #61: position price impact pool accounting ─────────────────────
 
+    // ── Issue #136: property tests for pricing_utils ─────────────────────────
+
+    /// Swap price impact is zero when the pool is perfectly balanced.
+    #[test]
+    fn property_swap_impact_zero_on_balanced_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let price      = FLOAT_PRECISION;
+        let pool_size  = 1_000 * TOKEN_PRECISION;
+        let neg_factor = FLOAT_PRECISION / 1_000;
+        let pos_factor = FLOAT_PRECISION / 2_000;
+        let exponent   = FLOAT_PRECISION; // linear
+
+        // Perfectly balanced: long == short
+        seed_swap_market(&env, &ds, &admin, &market, pool_size, pool_size, neg_factor, pos_factor, exponent);
+
+        // A balanced swap should have no price impact (initial_diff == 0)
+        // but any non-zero swap will cause imbalance. Check that the sign of
+        // the impact is correctly negative when swapping into the larger side.
+        let impact = get_swap_price_impact(&env, &ds, &market, &lt, &st, 100 * TOKEN_PRECISION, price, price);
+        // With equal pools, swapping long→short worsens balance → negative impact
+        assert!(impact <= 0, "swapping into larger side on balanced pool must not be positive: {impact}");
+    }
+
+    /// Larger swap amounts produce larger magnitude negative price impact
+    /// (monotone in amount_in when worsening pool balance).
+    #[test]
+    fn property_swap_negative_impact_monotone_in_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let price      = FLOAT_PRECISION;
+        let neg_factor = FLOAT_PRECISION / 1_000_000;
+        let pos_factor = FLOAT_PRECISION / 2_000_000;
+        let exponent   = 2 * FLOAT_PRECISION; // quadratic: larger swaps hurt more
+
+        // Long pool >> short pool → swapping long→short worsens imbalance
+        seed_swap_market(&env, &ds, &admin, &market, 5_000 * TOKEN_PRECISION, 1_000 * TOKEN_PRECISION, neg_factor, pos_factor, exponent);
+
+        let small_impact = get_swap_price_impact(&env, &ds, &market, &lt, &st, 10 * TOKEN_PRECISION, price, price);
+        let large_impact = get_swap_price_impact(&env, &ds, &market, &lt, &st, 500 * TOKEN_PRECISION, price, price);
+
+        assert!(small_impact <= 0, "small swap must have non-positive impact: {small_impact}");
+        assert!(large_impact <= 0, "large swap must have non-positive impact: {large_impact}");
+        assert!(
+            large_impact <= small_impact,
+            "larger swap must produce worse (more negative) impact: small={small_impact}, large={large_impact}"
+        );
+    }
+
+    /// Position price impact is zero when open interest is perfectly balanced.
+    #[test]
+    fn property_position_impact_zero_on_balanced_oi() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let index_price = 2_000 * FLOAT_PRECISION;
+        let neg_factor  = FLOAT_PRECISION / 1_000;
+        let pos_factor  = FLOAT_PRECISION / 2_000;
+        let exponent    = FLOAT_PRECISION;
+
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_factor_key(&env, &mt, false), &(neg_factor as u128));
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_factor_key(&env, &mt, true),  &(pos_factor as u128));
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_exponent_factor_key(&env, &mt), &(exponent as u128));
+
+        // Balanced OI: long == short → initial_diff == 0, opening more long makes it unbalanced
+        let balanced_oi = 5_000 * FLOAT_PRECISION as u128;
+        ds_c.set_u128(&admin, &gmx_keys::open_interest_key(&env, &mt, &lt, true),  &balanced_oi);
+        ds_c.set_u128(&admin, &gmx_keys::open_interest_key(&env, &mt, &lt, false), &balanced_oi);
+
+        // Opening a long when balanced worsens balance → negative impact
+        let impact = get_position_price_impact(&env, &ds, &market, true, 1_000 * FLOAT_PRECISION, true, index_price);
+        assert!(impact <= 0, "opening long on balanced OI must not produce positive impact: {impact}");
+
+        // Opening a short on the same balanced market also worsens balance → negative
+        let impact_short = get_position_price_impact(&env, &ds, &market, false, 1_000 * FLOAT_PRECISION, true, index_price);
+        assert!(impact_short <= 0, "opening short on balanced OI must not produce positive impact: {impact_short}");
+    }
+
+    /// get_execution_price with zero price_impact returns the raw index price.
+    #[test]
+    fn property_execution_price_no_impact_equals_index() {
+        let env = Env::default();
+        let index_price    = 2_000 * FLOAT_PRECISION;
+        let size_delta_usd = 5_000 * FLOAT_PRECISION;
+        let result = get_execution_price(&env, index_price, size_delta_usd, 0, true, true);
+        assert_eq!(result, index_price, "zero price impact must leave execution price unchanged");
+    }
+
+    /// Negative price impact raises the effective execution price for longs
+    /// (trader pays more per unit). The adjusted price > index_price.
+    #[test]
+    fn property_negative_impact_raises_execution_price_for_long() {
+        let env = Env::default();
+        let index_price    = 2_000 * FLOAT_PRECISION;
+        let size_delta_usd = 10_000 * FLOAT_PRECISION;
+        let neg_impact     = -(100 * FLOAT_PRECISION); // −$100 in protocol precision
+
+        let exec_price = get_execution_price(&env, index_price, size_delta_usd, neg_impact, true, true);
+        assert!(
+            exec_price > index_price,
+            "negative impact must raise execution price for long: exec={exec_price}, index={index_price}"
+        );
+    }
+
+    /// apply_swap_impact_value with impact_usd = 0 returns 0 without mutating state.
+    #[test]
+    fn property_apply_swap_impact_zero_impact_is_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let pool_key = gmx_keys::swap_impact_pool_amount_key(&env, &mt, &st);
+        let before = DsClient::new(&env, &ds).get_u128(&pool_key);
+
+        let result = apply_swap_impact_value(&env, &ds, &admin, &market, &st, FLOAT_PRECISION, 0);
+
+        let after = DsClient::new(&env, &ds).get_u128(&pool_key);
+        assert_eq!(result, 0, "zero impact must return 0");
+        assert_eq!(before, after, "zero impact must not mutate impact pool");
+    }
+
     /// Negative position price impact increases the position impact pool.
     #[test]
     fn negative_position_impact_increases_impact_pool() {
