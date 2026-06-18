@@ -92,6 +92,20 @@ impl DataStore {
             .unwrap_or(0)
     }
 
+    /// Read multiple u128 values in one call to reduce cross-contract call overhead.
+    pub fn get_u128_batch(env: Env, keys: Vec<BytesN<32>>) -> Vec<u128> {
+        let mut results = Vec::new(&env);
+        for key in keys.iter() {
+            let val: u128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::U128(key))
+                .unwrap_or(0);
+            results.push_back(val);
+        }
+        results
+    }
+
     pub fn set_u128(env: Env, caller: Address, key: BytesN<32>, value: u128) -> u128 {
         caller.require_auth();
         require_controller(&env, &caller);

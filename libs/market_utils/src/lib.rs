@@ -13,7 +13,7 @@ use gmx_keys::{
 };
 use gmx_math::{mul_div_wide, pow_factor, FLOAT_PRECISION, TOKEN_PRECISION};
 use gmx_types::{MarketProps, PoolValueInfo};
-use soroban_sdk::{Address, BytesN, Env};
+use soroban_sdk::{vec, Address, BytesN, Env, Vec};
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -30,6 +30,7 @@ pub enum Error {
 #[soroban_sdk::contractclient(name = "DataStoreClient")]
 trait IDataStore {
     fn get_u128(env: Env, key: BytesN<32>) -> u128;
+    fn get_u128_batch(env: Env, keys: Vec<BytesN<32>>) -> Vec<u128>;
     fn get_i128(env: Env, key: BytesN<32>) -> i128;
     fn set_u128(env: Env, caller: Address, key: BytesN<32>, value: u128) -> u128;
     fn set_i128(env: Env, caller: Address, key: BytesN<32>, value: i128) -> i128;
@@ -425,25 +426,71 @@ pub fn get_pool_value(
     index_token_price: i128,
     maximize: bool,
 ) -> PoolValueInfo {
-    let _ds_client = DataStoreClient::new(env, ds);
+    // Batch all 11 reads into a single cross-contract call to stay within Soroban's
+    // instruction budget (individual calls per read would each incur invocation overhead).
+    let keys = vec![
+        env,
+        pool_amount_key(env, &market.market_token, &market.long_token),
+        pool_amount_key(env, &market.market_token, &market.short_token),
+        position_impact_pool_amount_key(env, &market.market_token),
+        open_interest_key(env, &market.market_token, &market.long_token, true),
+        open_interest_key(env, &market.market_token, &market.short_token, true),
+        open_interest_key(env, &market.market_token, &market.long_token, false),
+        open_interest_key(env, &market.market_token, &market.short_token, false),
+        open_interest_in_tokens_key(env, &market.market_token, &market.long_token, true),
+        open_interest_in_tokens_key(env, &market.market_token, &market.short_token, true),
+        open_interest_in_tokens_key(env, &market.market_token, &market.long_token, false),
+        open_interest_in_tokens_key(env, &market.market_token, &market.short_token, false),
+    ];
+    let batch = DataStoreClient::new(env, ds).get_u128_batch(&keys);
 
-    let long_pool = get_pool_amount(env, ds, market, &market.long_token) as i128;
-    let short_pool = get_pool_amount(env, ds, market, &market.short_token) as i128;
+    let long_pool          = batch.get(0).unwrap_or(0) as i128;
+    let short_pool         = batch.get(1).unwrap_or(0) as i128;
+    let impact_pool_tokens = batch.get(2).unwrap_or(0) as i128;
 
-    // USD value of pool tokens = amount × price / TOKEN_PRECISION
-    let long_usd = mul_div_wide(env, long_pool, long_token_price, TOKEN_PRECISION);
-    let short_usd = mul_div_wide(env, short_pool, short_token_price, TOKEN_PRECISION);
+    // open interest in USD
+    let oi_long_lt  = batch.get(3).unwrap_or(0) as i128;
+    let oi_long_st  = batch.get(4).unwrap_or(0) as i128;
+    let oi_short_lt = batch.get(5).unwrap_or(0) as i128;
+    let oi_short_st = batch.get(6).unwrap_or(0) as i128;
 
-    // Impact pool (denominated in index token)
-    let impact_pool_tokens = get_position_impact_pool_amount(env, ds, market) as i128;
+    // open interest in tokens
+    let oit_long_lt  = batch.get(7).unwrap_or(0) as i128;
+    let oit_long_st  = batch.get(8).unwrap_or(0) as i128;
+    let oit_short_lt = batch.get(9).unwrap_or(0) as i128;
+    let oit_short_st = batch.get(10).unwrap_or(0) as i128;
+
+    // USD value of pool tokens
+    let long_usd       = mul_div_wide(env, long_pool, long_token_price, TOKEN_PRECISION);
+    let short_usd      = mul_div_wide(env, short_pool, short_token_price, TOKEN_PRECISION);
     let impact_pool_usd = mul_div_wide(env, impact_pool_tokens, index_token_price, TOKEN_PRECISION);
 
-    // Net PnL for each side
-    let long_pnl = get_pnl(env, ds, market, index_token_price, true, maximize);
-    let short_pnl = get_pnl(env, ds, market, index_token_price, false, maximize);
-    let net_pnl = long_pnl + short_pnl;
+    // Inline PnL calculation for longs
+    let long_pnl = {
+        let oi_usd    = oi_long_lt + oi_long_st;
+        let oi_tokens = oit_long_lt + oit_long_st;
+        if oi_tokens == 0 {
+            0
+        } else {
+            let pos_val = mul_div_wide(env, oi_tokens, index_token_price, TOKEN_PRECISION);
+            pos_val - oi_usd
+        }
+    };
 
-    // Total value = longUSD + shortUSD + impactPool - netPnL (PnL is owed to traders)
+    // Inline PnL calculation for shorts
+    let short_pnl = {
+        let oi_usd    = oi_short_lt + oi_short_st;
+        let oi_tokens = oit_short_lt + oit_short_st;
+        if oi_tokens == 0 {
+            0
+        } else {
+            let pos_val = mul_div_wide(env, oi_tokens, index_token_price, TOKEN_PRECISION);
+            oi_usd - pos_val
+        }
+    };
+
+    let _ = maximize; // reserved for future min/max price selection
+    let net_pnl = long_pnl + short_pnl;
     let pool_value = long_usd + short_usd + impact_pool_usd - net_pnl;
 
     PoolValueInfo {

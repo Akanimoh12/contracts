@@ -56,6 +56,16 @@ enum TempKey {
     Price(Address),
 }
 
+/// Ledgers to keep a submitted price readable in temporary storage.
+///
+/// `set_prices` and `execute_*` run in **separate** transactions, and a keeper
+/// may drain a batch of pending orders one-by-one after a single price set.
+/// Bumping the temp TTL keeps prices readable across that window so later
+/// executions in the batch don't revert with `PriceNotFound`. Kept short so
+/// prices remain ephemeral (≈10 min at ~5s/ledger), in line with the 300s /
+/// 60-ledger freshness window enforced at submission time.
+const PRICE_TTL_LEDGERS: u32 = 120;
+
 // ─── Signed price submitted by keeper ────────────────────────────────────────
 
 /// One signed price attestation from a keeper.
@@ -126,9 +136,13 @@ impl Oracle {
 
     // ── Upgrade ──────────────────────────────────────────────────────────────
 
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
-        caller.require_auth();
-        require_admin(&env, &caller);
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
@@ -192,42 +206,21 @@ impl Oracle {
             // ed25519_verify takes (&BytesN<32> pubkey, &Bytes message, &BytesN<64> sig)
             env.crypto().ed25519_verify(&pubkey, &msg, &sp.signature);
 
-            // Store in temporary storage (expires at end of current ledger TTL)
+            // Store in temporary storage and bump its TTL so the price survives
+            // the keeper's set_prices → execute_* batch window (see PRICE_TTL_LEDGERS).
             let price = PriceProps {
                 min: sp.min_price,
                 max: sp.max_price,
             };
+            let price_key = TempKey::Price(sp.token.clone());
+            env.storage().temporary().set(&price_key, &price);
             env.storage()
                 .temporary()
-                .set(&TempKey::Price(sp.token.clone()), &price);
+                .extend_ttl(&price_key, PRICE_TTL_LEDGERS, PRICE_TTL_LEDGERS);
         }
 
         env.events()
             .publish((symbol_short!("prices"),), (caller, prices.len()));
-    }
-
-    /// Submit prices without signature verification.
-    ///
-    /// Simpler path: caller must have ORDER_KEEPER role, no ed25519 required.
-    /// Suitable for local/test environments where keepers are fully trusted.
-    #[cfg(any(test, feature = "testutils"))]
-    pub fn set_prices_simple(env: Env, caller: Address, prices: Vec<TokenPrice>) {
-        caller.require_auth();
-        require_order_keeper(&env, &caller);
-
-        for i in 0..prices.len() {
-            let tp = prices.get(i).unwrap();
-            if tp.min <= 0 || tp.max <= 0 || tp.min > tp.max {
-                panic_with_error!(&env, Error::InvalidPrice);
-            }
-            let price = PriceProps {
-                min: tp.min,
-                max: tp.max,
-            };
-            env.storage()
-                .temporary()
-                .set(&TempKey::Price(tp.token.clone()), &price);
-        }
     }
 
     // ── Price reads ───────────────────────────────────────────────────────────
@@ -304,18 +297,43 @@ impl Oracle {
     }
 }
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
+// ─── Test-only price submission ────────────────────────────────────────────────
+//
+// Kept in a separate, feature-gated `#[contractimpl]` block so the generated
+// invoke wrapper is also gated. Inlining a `#[cfg(...)]` method in the main impl
+// makes the macro emit a wrapper that references the stripped fn in non-test
+// builds, which fails to compile under the current SDK.
 
-fn require_admin(env: &Env, caller: &Address) {
-    let admin: Address = env
-        .storage()
-        .instance()
-        .get(&InstanceKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-    if *caller != admin {
-        panic_with_error!(env, Error::Unauthorized);
+#[cfg(any(test, feature = "testutils"))]
+#[contractimpl]
+impl Oracle {
+    /// Submit prices without signature verification.
+    ///
+    /// Simpler path: caller must have ORDER_KEEPER role, no ed25519 required.
+    /// Suitable for local/test environments where keepers are fully trusted.
+    pub fn set_prices_simple(env: Env, caller: Address, prices: Vec<TokenPrice>) {
+        caller.require_auth();
+        require_order_keeper(&env, &caller);
+
+        for i in 0..prices.len() {
+            let tp = prices.get(i).unwrap();
+            if tp.min <= 0 || tp.max <= 0 || tp.min > tp.max {
+                panic_with_error!(&env, Error::InvalidPrice);
+            }
+            let price = PriceProps {
+                min: tp.min,
+                max: tp.max,
+            };
+            let price_key = TempKey::Price(tp.token.clone());
+            env.storage().temporary().set(&price_key, &price);
+            env.storage()
+                .temporary()
+                .extend_ttl(&price_key, PRICE_TTL_LEDGERS, PRICE_TTL_LEDGERS);
+        }
     }
 }
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
 fn require_order_keeper(env: &Env, caller: &Address) {
     let role_store: Address = env
